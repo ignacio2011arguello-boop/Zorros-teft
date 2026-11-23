@@ -1,0 +1,888 @@
+name: apk
+on: [push, workflow_dispatch]
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: {distribution: temurin, java-version: 17}
+      - uses: gradle/actions/setup-gradle@v3
+        with: {gradle-version: 8.7}
+      - run: |
+          mkdir -p app/src/main/java/com/hazball/mobile app/src/main/assets
+          cat > settings.gradle <<'EOF'
+          pluginManagement{repositories{google();mavenCentral();gradlePluginPortal()}}
+          dependencyResolutionManagement{repositories{google();mavenCentral()}}
+          rootProject.name="HazBall"
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins{id 'com.android.application' version '8.5.2' apply false}
+          EOF
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins{id 'com.android.application'}
+          android{
+            namespace 'com.hazball.mobile'
+            compileSdk 34
+            defaultConfig{applicationId 'com.hazball.mobile';minSdk 24;targetSdk 34;versionCode 2;versionName '2.0'}
+            compileOptions{sourceCompatibility JavaVersion.VERSION_17;targetCompatibility JavaVersion.VERSION_17}
+          }
+          dependencies{
+            implementation 'androidx.webkit:webkit:1.11.0'
+            implementation 'androidx.core:core:1.13.1'
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <application android:label="HazBall" android:hardwareAccelerated="true" android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+              <activity android:name=".MainActivity" android:exported="true"
+                android:screenOrientation="sensorLandscape"
+                android:windowSoftInputMode="adjustResize"
+                android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/hazball/mobile/MainActivity.java <<'EOF'
+          package com.hazball.mobile;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.FrameLayout;
+          import android.widget.Toast;
+          import androidx.core.view.WindowCompat;
+          import androidx.core.view.WindowInsetsCompat;
+          import androidx.core.view.WindowInsetsControllerCompat;
+          import androidx.webkit.ScriptHandler;
+          import androidx.webkit.WebViewCompat;
+          import androidx.webkit.WebViewFeature;
+          import java.io.ByteArrayInputStream;
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.util.Collections;
+          import org.json.JSONObject;
+          public class MainActivity extends Activity {
+            static final String URL = "https://www.haxball.com/play";
+            static final String UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+            static final String[] ADS = {"doubleclick", "googlesyndication", "googleadservices", "adinplay", "adsbygoogle",
+              "google-analytics", "googletagmanager", "amazon-adsystem", "adnxs", "taboola", "outbrain", "criteo", "pubmatic",
+              "rubiconproject", "openx.net", "smartadserver", "moatads", "adsrvr", "casalemedia", "adform", "venatus",
+              "nitropay", "playwire", "snigel", "freestar", "aniview", "connatix"};
+            WebView game, menu;
+            Pad pad;
+            ScriptHandler sh;
+            SharedPreferences sp;
+            volatile boolean started;
+            volatile boolean blockAds = true;
+            long lastBack;
+            ValueCallback<Uri[]> fileCb;
+
+            class Bridge {
+              @JavascriptInterface public String get() { return sp.getString("cfg", "{}"); }
+              @JavascriptInterface public void save(String j) { sp.edit().putString("cfg", j).apply(); }
+              @JavascriptInterface public boolean started() { return started; }
+              @JavascriptInterface public void play(String j, boolean reload) {
+                sp.edit().putString("cfg", j).apply();
+                runOnUiThread(() -> launch(reload));
+              }
+              @JavascriptInterface public void quit() { runOnUiThread(() -> finish()); }
+            }
+
+            @Override protected void onCreate(Bundle b) {
+              super.onCreate(b);
+              getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+              if (Build.VERSION.SDK_INT >= 28)
+                getWindow().getAttributes().layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+              sp = getSharedPreferences("hz", 0);
+              FrameLayout root = new FrameLayout(this);
+              root.setBackgroundColor(0xFF05070D);
+
+              game = new WebView(this);
+              WebSettings s = game.getSettings();
+              s.setJavaScriptEnabled(true);
+              s.setDomStorageEnabled(true);
+              s.setMediaPlaybackRequiresUserGesture(false);
+              s.setSupportZoom(false);
+              s.setUserAgentString(UA);
+              game.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+              game.setBackgroundColor(0xFF1A2125);
+              game.setWebViewClient(new WebViewClient() {
+                @Override public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
+                  if (blockAds) {
+                    String h = r.getUrl().getHost();
+                    if (h != null) for (String a : ADS)
+                      if (h.contains(a)) return new WebResourceResponse("text/plain", "utf-8", new ByteArrayInputStream(new byte[0]));
+                  }
+                  return null;
+                }
+              });
+              game.setWebChromeClient(new WebChromeClient());
+
+              menu = new WebView(this);
+              WebSettings m = menu.getSettings();
+              m.setJavaScriptEnabled(true);
+              m.setDomStorageEnabled(true);
+              menu.setBackgroundColor(0xFF05070D);
+              menu.addJavascriptInterface(new Bridge(), "HBApp");
+              menu.setWebChromeClient(new WebChromeClient() {
+                @Override public boolean onShowFileChooser(WebView w, ValueCallback<Uri[]> cb, FileChooserParams p) {
+                  if (fileCb != null) fileCb.onReceiveValue(null);
+                  fileCb = cb;
+                  Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                  i.addCategory(Intent.CATEGORY_OPENABLE);
+                  i.setType("image/*");
+                  try { startActivityForResult(Intent.createChooser(i, "Elegí una imagen"), 7); }
+                  catch (Exception e) { fileCb = null; return false; }
+                  return true;
+                }
+              });
+              menu.loadUrl("file:///android_asset/menu.html");
+
+              pad = new Pad(this, game);
+              pad.onSettings = this::showMenu;
+              pad.setVisibility(View.GONE);
+
+              root.addView(game, new FrameLayout.LayoutParams(-1, -1));
+              root.addView(pad, new FrameLayout.LayoutParams(-1, -1));
+              root.addView(menu, new FrameLayout.LayoutParams(-1, -1));
+              setContentView(root);
+            }
+
+            @Override protected void onActivityResult(int rq, int rs, Intent d) {
+              super.onActivityResult(rq, rs, d);
+              if (rq == 7 && fileCb != null) {
+                fileCb.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(rs, d));
+                fileCb = null;
+              }
+            }
+
+            String asset(String n) {
+              try (InputStream is = getAssets().open(n)) {
+                ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int r;
+                while ((r = is.read(buf)) > 0) bo.write(buf, 0, r);
+                return bo.toString("UTF-8") + "\n;\n";
+              } catch (Exception e) { return ""; }
+            }
+
+            void launch(boolean reload) {
+              String cfg = sp.getString("cfg", "{}");
+              try {
+                JSONObject c = new JSONObject(cfg);
+                JSONObject p = c.optJSONObject("pad");
+                if (p != null) pad.apply((float) p.optDouble("scale", 1), (float) p.optDouble("alpha", 1), p.optBoolean("left", false), p.optBoolean("vib", true));
+                JSONObject sc = c.optJSONObject("screen");
+                blockAds = sc == null || sc.optBoolean("noads", true);
+              } catch (Exception e) { }
+              if (reload || !started) {
+                if (sh != null) { sh.remove(); sh = null; }
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT))
+                  sh = WebViewCompat.addDocumentStartJavaScript(game, "window.__HB=" + cfg + ";\n" + asset("common.js") + asset("hb.js"), Collections.singleton("*"));
+                started = true;
+                game.loadUrl(URL);
+              }
+              menu.setVisibility(View.GONE);
+              menu.evaluateJavascript("window.fx&&fx(0)", null);
+              pad.setVisibility(View.VISIBLE);
+              game.requestFocus();
+            }
+
+            void showMenu() {
+              pad.releaseAll();
+              pad.setVisibility(View.GONE);
+              menu.setVisibility(View.VISIBLE);
+              menu.evaluateJavascript("window.fx&&fx(1)", null);
+              menu.requestFocus();
+            }
+
+            void hideBars() {
+              WindowInsetsControllerCompat c = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+              c.hide(WindowInsetsCompat.Type.systemBars());
+              c.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            }
+            @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) hideBars(); }
+            @Override protected void onPause() { super.onPause(); game.onPause(); }
+            @Override protected void onResume() { super.onResume(); game.onResume(); }
+            @Override public void onBackPressed() {
+              if (menu.getVisibility() != View.VISIBLE) { showMenu(); return; }
+              if (started) { launch(false); return; }
+              long n = System.currentTimeMillis();
+              if (n - lastBack < 2000) finish();
+              else { lastBack = n; Toast.makeText(this, "Toca atrás otra vez para salir", Toast.LENGTH_SHORT).show(); }
+            }
+          }
+          EOF
+          cat > app/src/main/java/com/hazball/mobile/Pad.java <<'EOF'
+          package com.hazball.mobile;
+          import android.content.Context;
+          import android.graphics.Canvas;
+          import android.graphics.Paint;
+          import android.os.SystemClock;
+          import android.view.HapticFeedbackConstants;
+          import android.view.KeyEvent;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.webkit.WebView;
+          public class Pad extends View {
+            static final int[] KC = {KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN};
+            final WebView web;
+            Runnable onSettings;
+            boolean on = true, lf = false, vib = true;
+            int jid = -1, kid = -1;
+            float ox, oy, tx, ty, d, R, sc = 1, al = 1;
+            final boolean[] k = new boolean[4];
+            final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+            Pad(Context c, WebView w) {
+              super(c);
+              web = w;
+              d = c.getResources().getDisplayMetrics().density;
+              R = 60 * d;
+              setFocusable(false);
+              setFocusableInTouchMode(false);
+            }
+            void apply(float s, float a, boolean l, boolean v) {
+              sc = s; al = a; lf = l; vib = v;
+              R = 60 * d * sc;
+              invalidate();
+            }
+            void key(int code, boolean down) {
+              long t = SystemClock.uptimeMillis();
+              web.dispatchKeyEvent(new KeyEvent(t, t, down ? KeyEvent.ACTION_DOWN : KeyEvent.ACTION_UP, code, 0));
+            }
+            void dirs() {
+              float dx = tx - ox, dy = ty - oy, z = R * .3f;
+              boolean[] n = {dx < -z, dx > z, dy < -z, dy > z};
+              for (int i = 0; i < 4; i++) if (n[i] != k[i]) { k[i] = n[i]; key(KC[i], n[i]); }
+            }
+            void relDirs() { for (int i = 0; i < 4; i++) if (k[i]) { k[i] = false; key(KC[i], false); } }
+            void releaseAll() { relDirs(); if (kid >= 0) key(KeyEvent.KEYCODE_X, false); jid = kid = -1; }
+            float gx() { return getWidth() - 30 * d; }
+            float ex() { return getWidth() - 76 * d; }
+            float ay() { return 30 * d; }
+            float kx() { return lf ? 90 * d : getWidth() - 90 * d; }
+            float ky() { return getHeight() - 90 * d; }
+            boolean joyZone(float x, float y) { return y > getHeight() * .3f && (lf ? x > getWidth() * .55f : x < getWidth() * .45f); }
+            boolean kickZone(float x, float y) { return y > getHeight() * .3f && (lf ? x < getWidth() * .45f : x > getWidth() * .55f); }
+            boolean hit(float x, float y, float cx, float cy, float r) { return Math.hypot(x - cx, y - cy) < r; }
+            void col(int argb) { p.setColor(argb); p.setAlpha((int) ((argb >>> 24) * al)); }
+            @Override public boolean onTouchEvent(MotionEvent e) {
+              int a = e.getActionMasked(), idx = e.getActionIndex(), id = e.getPointerId(idx);
+              float x = e.getX(idx), y = e.getY(idx);
+              switch (a) {
+                case MotionEvent.ACTION_DOWN:
+                case MotionEvent.ACTION_POINTER_DOWN:
+                  if (hit(x, y, gx(), ay(), 26 * d)) { if (onSettings != null) onSettings.run(); return true; }
+                  if (hit(x, y, ex(), ay(), 26 * d)) { on = !on; releaseAll(); invalidate(); return true; }
+                  if (!on) return false;
+                  if (joyZone(x, y) && jid < 0) {
+                    jid = id; ox = tx = x; oy = ty = y; invalidate(); return true;
+                  }
+                  if (kickZone(x, y) && kid < 0) {
+                    kid = id; key(KeyEvent.KEYCODE_X, true);
+                    if (vib) performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+                    invalidate(); return true;
+                  }
+                  return false;
+                case MotionEvent.ACTION_MOVE:
+                  for (int i = 0; i < e.getPointerCount(); i++) if (e.getPointerId(i) == jid) {
+                    tx = e.getX(i); ty = e.getY(i);
+                    float dx = tx - ox, dy = ty - oy, l = (float) Math.hypot(dx, dy);
+                    if (l > R) { ox += dx / l * (l - R); oy += dy / l * (l - R); }
+                    dirs(); invalidate();
+                  }
+                  return jid >= 0 || kid >= 0;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_POINTER_UP:
+                case MotionEvent.ACTION_CANCEL:
+                  if (id == jid) { jid = -1; relDirs(); invalidate(); }
+                  if (id == kid) { kid = -1; key(KeyEvent.KEYCODE_X, false); invalidate(); }
+                  return true;
+              }
+              return false;
+            }
+            @Override protected void onDraw(Canvas c) {
+              p.setStyle(Paint.Style.FILL);
+              p.setTextAlign(Paint.Align.CENTER);
+              p.setTextSize(22 * d);
+              p.setColor(0xFFFFFFFF); p.setAlpha(0x66);
+              c.drawText("☰", gx(), ay() + 8 * d, p);
+              c.drawText("🎮", ex(), ay() + 8 * d, p);
+              if (!on) return;
+              float bx = jid >= 0 ? ox : (lf ? getWidth() - 110 * d : 110 * d), by = jid >= 0 ? oy : getHeight() - 100 * d;
+              p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(3 * d);
+              col(jid >= 0 ? 0x88FFFFFF : 0x33FFFFFF);
+              c.drawCircle(bx, by, R, p);
+              p.setStyle(Paint.Style.FILL);
+              if (jid >= 0) { col(0x66FFFFFF); c.drawCircle(tx, ty, 26 * d * sc, p); }
+              col(kid >= 0 ? 0x88FFFFFF : 0x33FFFFFF);
+              c.drawCircle(kx(), ky(), 44 * d * sc, p);
+              col(0xCCFFFFFF); p.setTextSize(13 * d);
+              c.drawText("PATEAR", kx(), ky() + 5 * d, p);
+            }
+          }
+          EOF
+          cat > app/src/main/assets/common.js <<'EOF'
+          var HBX=(function(){
+          var T=6.2832,PI=Math.PI;
+          function rnd(n){return Math.abs(Math.sin(n*127.1)*43758.5453)%1}
+          function circ(c,x,y,r){c.beginPath();c.arc(x,y,r,0,T)}
+          function poly(c,x,y,R,n,o){c.beginPath();for(var i=0;i<n;i++){var a=o+i*T/n;c.lineTo(x+Math.cos(a)*R,y+Math.sin(a)*R)}c.closePath();c.fill()}
+          function ring(c,x,y,r,col){c.lineWidth=Math.max(1,r*.1);c.strokeStyle=col;circ(c,x,y,r-c.lineWidth/2);c.stroke()}
+          function cimg(c,im,x,y,r){c.save();circ(c,x,y,r);c.clip();c.drawImage(im,x-r,y-r,2*r,2*r);c.restore();ring(c,x,y,r,'#000')}
+          function jersey(c,x,y,r,j){
+            var k=j.c,p=j.pat,i,a,b,n=5,w=2*r/n;
+            c.save();circ(c,x,y,r);c.clip();
+            c.fillStyle=k[0];c.fillRect(x-r,y-r,2*r,2*r);
+            c.save();c.fillStyle=k[1];
+            if(p=='v'||p=='d'){
+              if(p=='d'){c.translate(x,y);c.rotate(-.785);c.translate(-x,-y)}
+              for(i=1;i<n;i+=2)c.fillRect(x-r+i*w,y-1.5*r,w,3*r);
+            }else if(p=='h'){for(i=1;i<n;i+=2)c.fillRect(x-1.5*r,y-r+i*w,3*r,w)}
+            else if(p=='half')c.fillRect(x,y-r,r,2*r);
+            else if(p=='check'){for(a=0;a<4;a++)for(b=0;b<4;b++)if((a+b)%2)c.fillRect(x-r+a*r/2,y-r+b*r/2,r/2,r/2)}
+            c.restore();
+            if(j.num){c.fillStyle=k[2];c.font='bold '+(r*1.15)+'px sans-serif';c.textAlign='center';c.textBaseline='middle';c.fillText(String(j.num).slice(0,2),x,y)}
+            c.restore();
+            ring(c,x,y,r,k[2]);
+          }
+          function aura(c,x,y,r,a,t){
+            var ty=a.type;if(!ty||ty=='none')return;
+            var s=a.size,col=a.color,i,k,ph,an,d,z,px,py,f,R=r*(1.2+.35*s);
+            t=t*a.speed;
+            c.save();c.globalCompositeOperation='lighter';c.lineCap='round';c.strokeStyle=col;c.fillStyle=col;
+            if(ty=='ring'){
+              for(i=0;i<3;i++){c.globalAlpha=(.55-i*.16)*(.75+.25*Math.sin(t*4));c.lineWidth=r*(.18+i*.2);circ(c,x,y,R+i*r*.05);c.stroke()}
+            }else if(ty=='pulse'){
+              for(i=0;i<3;i++){ph=(t*.7+i/3)%1;c.globalAlpha=(1-ph)*.8;c.lineWidth=r*.18;circ(c,x,y,r*(1+ph*1.4*s));c.stroke()}
+            }else if(ty=='rainbow'){
+              c.lineWidth=r*.3;c.globalAlpha=.85;
+              for(i=0;i<12;i++){c.strokeStyle='hsl('+((i*30+t*120)%360)+',100%,60%)';c.beginPath();c.arc(x,y,R,i*T/12,(i+1.15)*T/12);c.stroke()}
+            }else if(ty=='fire'){
+              for(i=0;i<16;i++){ph=(t*1.3+i/16)%1;k=Math.sin(i*12.9+1)*r*.8;c.globalAlpha=(1-ph)*.9;c.fillStyle='hsl('+(8+ph*45)+',100%,'+(50+ph*10)+'%)';circ(c,x+k*(1-ph),y+r*.4-ph*r*2.2*s,r*.42*(1-ph*.8));c.fill()}
+            }else if(ty=='bolt'){
+              f=Math.floor(t*10);c.lineWidth=Math.max(1.5,r*.12);c.globalAlpha=.95;
+              for(i=0;i<5;i++){
+                an=rnd(f*7+i)*T;c.beginPath();c.moveTo(x+Math.cos(an)*r,y+Math.sin(an)*r);
+                for(k=1;k<=4;k++){an+=(rnd(f*13+i*5+k)-.5)*.9;d=r*(1+k*.3*s);c.lineTo(x+Math.cos(an)*d,y+Math.sin(an)*d)}
+                c.stroke();
+              }
+              c.globalAlpha=.25;c.lineWidth=r*.3;circ(c,x,y,r*1.1);c.stroke();
+            }else if(ty=='stars'){
+              z=r*.28;c.globalAlpha=.95;
+              for(i=0;i<6;i++){
+                an=t*2+i*T/6;d=R*(1+.12*Math.sin(t*3+i));px=x+Math.cos(an)*d;py=y+Math.sin(an)*d;
+                c.beginPath();c.moveTo(px,py-z);c.lineTo(px+z*.35,py-z*.35);c.lineTo(px+z,py);c.lineTo(px+z*.35,py+z*.35);
+                c.lineTo(px,py+z);c.lineTo(px-z*.35,py+z*.35);c.lineTo(px-z,py);c.lineTo(px-z*.35,py-z*.35);c.closePath();c.fill();
+              }
+            }
+            c.restore();
+          }
+          function curves(c,x,y,r){
+            c.beginPath();c.arc(x-r*1.1,y,r*.95,-.9,.9);c.stroke();
+            c.beginPath();c.arc(x+r*1.1,y,r*.95,PI-.9,PI+.9);c.stroke();
+          }
+          function ball(c,x,y,r,b,im){
+            var k=b.skin,col=b.color,i,g,u=x-r,v=y-r,w=2*r;
+            if(b.photo&&im){cimg(c,im,x,y,r);return}
+            if(!k||k=='classic')return;
+            c.save();circ(c,x,y,r);c.clip();
+            if(k=='color'){c.fillStyle=col;c.fillRect(u,v,w,w);c.fillStyle='rgba(255,255,255,.4)';circ(c,x-r*.3,y-r*.3,r*.4);c.fill()}
+            else if(k=='soccer'){
+              c.fillStyle='#fff';c.fillRect(u,v,w,w);c.fillStyle='#111';poly(c,x,y,r*.4,5,-1.5708);
+              for(i=0;i<5;i++)poly(c,x+Math.cos(i*1.2566-1.5708)*r*1.05,y+Math.sin(i*1.2566-1.5708)*r*1.05,r*.45,5,i*1.2566);
+            }else if(k=='basket'){
+              c.fillStyle='#e8772e';c.fillRect(u,v,w,w);c.strokeStyle='#2b1200';c.lineWidth=Math.max(1,r*.1);
+              c.beginPath();c.moveTo(x,v);c.lineTo(x,y+r);c.moveTo(u,y);c.lineTo(x+r,y);c.stroke();curves(c,x,y,r);
+            }else if(k=='tennis'){
+              c.fillStyle='#c6e32c';c.fillRect(u,v,w,w);c.strokeStyle='#fff';c.lineWidth=r*.16;curves(c,x,y,r);
+            }else if(k=='neon'){
+              c.fillStyle='#070912';c.fillRect(u,v,w,w);c.strokeStyle=col;c.lineWidth=r*.2;circ(c,x,y,r*.55);c.stroke();
+            }else if(k=='fire'){
+              g=c.createRadialGradient(x,y,0,x,y,r);g.addColorStop(0,'#fff6a0');g.addColorStop(.5,'#ff9d00');g.addColorStop(1,'#e22d00');
+              c.fillStyle=g;c.fillRect(u,v,w,w);
+            }
+            c.restore();
+            ring(c,x,y,r,k=='neon'?col:'#111');
+          }
+          function trail(c,tr,x,y,r,b){
+            var k=b.trail,i,f;
+            if(!k||k=='none'){tr.length=0;return}
+            tr.push([x,y]);if(tr.length>16)tr.shift();
+            c.save();c.globalCompositeOperation='lighter';
+            for(i=0;i<tr.length-2;i++){
+              f=i/tr.length;c.globalAlpha=f*.7;
+              c.fillStyle=k=='fire'?'hsl('+(10+f*40)+',100%,55%)':k=='rainbow'?'hsl('+(f*300)+',100%,60%)':b.color;
+              circ(c,tr[i][0],tr[i][1],r*(.2+.8*f));c.fill();
+            }
+            c.restore();
+          }
+          return{jersey:jersey,aura:aura,ball:ball,trail:trail,cimg:cimg};
+          })();
+          EOF
+          cat > app/src/main/assets/hb.js <<'EOF'
+          (function(){
+          var H=window.__HB||{},S=H.screen||{},isTop=window.top===window;
+
+          /* ---------- FPS limiter ---------- */
+          try{
+            var fps=+S.fps;
+            if(fps>0){
+              var raf=window.requestAnimationFrame.bind(window),mi=1000/fps,last=0;
+              window.requestAnimationFrame=function(cb){
+                return raf(function t(n){
+                  if(n-last<mi-1.2){raf(t);return}
+                  last=n-last>mi*2?n:last+mi;cb(n);
+                });
+              };
+            }
+          }catch(e){}
+
+          /* ---------- Resolution scale (devicePixelRatio) ---------- */
+          try{
+            var q=+S.quality||1;
+            if(q!==1){
+              var d0=window.devicePixelRatio||1;
+              Object.defineProperty(window,'devicePixelRatio',{get:function(){return Math.max(.5,d0*q)},configurable:true});
+            }
+          }catch(e){}
+
+          /* ---------- Top page: remove ads + stretched view ---------- */
+          if(isTop){
+            var RT={'43':4/3,'54':5/4,'32':3/2},ratio=RT[S.stretch];
+            var layout=function(){
+              try{
+                var f=document.querySelector('iframe.gameframe');
+                if(!f){
+                  var l=[].slice.call(document.querySelectorAll('iframe'));
+                  l.sort(function(a,b){return b.offsetWidth*b.offsetHeight-a.offsetWidth*a.offsetHeight});
+                  f=l[0];
+                }
+                if(!f)return;
+                if(S.noads!==false){
+                  var n=f;
+                  while(n&&n!==document.body&&n.parentNode){
+                    [].forEach.call(n.parentNode.children,function(s){
+                      if(s!==n&&s.tagName!=='STYLE'&&s.tagName!=='SCRIPT'&&s.tagName!=='LINK')s.style.setProperty('display','none','important');
+                    });
+                    n=n.parentNode;
+                  }
+                }
+                var W=window.innerWidth,Hh=window.innerHeight,st='position:fixed!important;left:0;top:0;border:0;margin:0;z-index:2147483647;background:#1a2125;';
+                if(ratio&&W>Hh*ratio){
+                  var iw=Math.round(Hh*ratio);
+                  st+='width:'+iw+'px!important;height:'+Hh+'px!important;transform-origin:0 0;transform:scaleX('+(W/iw)+');';
+                }else st+='width:100vw!important;height:100vh!important;';
+                if(f.__st!==st){
+                  f.__st=st;f.style.cssText=st;
+                  document.documentElement.style.cssText='overflow:hidden;background:#1a2125';
+                  document.body.style.cssText='margin:0;overflow:hidden;background:#1a2125';
+                }
+              }catch(e){}
+            };
+            document.addEventListener('DOMContentLoaded',layout);
+            window.addEventListener('resize',layout);
+            setInterval(layout,800);
+          }
+
+          /* ---------- Canvas hooks: skins, auras, ball ---------- */
+          var P=window.CanvasRenderingContext2D&&CanvasRenderingContext2D.prototype;
+          if(P&&window.HBX){
+            var G={arc:null,n:0,busy:0,sp:new WeakMap(),pt:new WeakMap(),tr:[]};
+            var av=H.avatar||'',J=H.jersey||{},A=H.aura||{},B=H.ball||{};
+            var jOn=!!J.on,pOn=!!(H.photoOn&&H.photo),aOn=!!(A.type&&A.type!='none');
+            var bOn=!!(B.skin&&B.skin!='classic'||B.photo||B.trail&&B.trail!='none');
+            var IP=new Image(),IB=new Image();
+            if(H.photo)IP.src=H.photo;
+            if(B.photo)IB.src=B.photo;
+            var ok=function(i){return i.complete&&i.naturalWidth>0};
+            var sc=function(m){return Math.hypot(m.a,m.b)};
+            var ap=function(m,x,y){return[m.a*x+m.c*y+m.e,m.b*x+m.d*y+m.f]};
+            var now=function(){return performance.now()/1000};
+
+            var drawAura=function(c,m,x,y,r){
+              var p=ap(m,x,y);G.busy++;
+              try{c.save();c.setTransform(1,0,0,1,0,0);HBX.aura(c,p[0],p[1],r*sc(m),A,now())}
+              finally{c.restore();G.busy--}
+            };
+            var pre=function(n,f){
+              var o=P[n];
+              P[n]=function(){var r;try{if(!G.busy)r=f.call(this,arguments)}catch(e){G.busy=0}if(r===1)return;return o.apply(this,arguments)};
+            };
+            var post=function(n,f){
+              var o=P[n];
+              P[n]=function(){var r=o.apply(this,arguments);try{if(!G.busy)f.call(this,arguments)}catch(e){G.busy=0}return r};
+            };
+
+            pre('beginPath',function(){G.n=0;G.arc=null});
+            pre('arc',function(a){
+              var r=a[2];G.n++;
+              G.arc=(r>8.5&&r<17.5)?{x:a[0],y:a[1],r:r,m:this.getTransform()}:null;
+            });
+            var cp=P.createPattern;
+            P.createPattern=function(i){
+              var p=cp.apply(this,arguments);
+              try{if(G.sp.has(i))G.pt.set(p,i)}catch(e){}
+              return p;
+            };
+
+            /* player skin: runs when the avatar marker text is drawn */
+            pre('fillText',function(a){
+              if(!av||a[0]!==av||!(jOn||pOn))return;
+              var g=G.arc&&G.arc.r>12.5?G.arc:null,c=this,m=g?g.m:c.getTransform(),x=g?g.x:a[1],y=g?g.y:a[2],r0=g?g.r:15,r=r0-1.2;
+              var photo=pOn&&ok(IP);
+              G.busy++;
+              try{
+                c.save();if(g)c.setTransform(m);
+                if(photo)HBX.cimg(c,IP,x,y,r);else if(jOn)HBX.jersey(c,x,y,r,J);
+              }finally{c.restore();G.busy--}
+              var cv=c.canvas;
+              if(cv&&cv.isConnected){if(aOn)drawAura(c,m,x,y,r0)}
+              else if(cv){var p=ap(m,x,y);G.sp.set(cv,{cx:p[0],cy:p[1],r:r0*sc(m)})}
+              return photo?1:0;
+            });
+
+            /* aura for cached player sprites */
+            post('drawImage',function(a){
+              var i=a[0],mt=aOn&&G.sp.get(i);
+              if(!mt)return;
+              var sx=0,sy=0,sw=i.width,sh=i.height,dx,dy,dw,dh;
+              if(a.length>=9){sx=a[1];sy=a[2];sw=a[3];sh=a[4];dx=a[5];dy=a[6];dw=a[7];dh=a[8]}
+              else{dx=a[1];dy=a[2];dw=a.length>=5?a[3]:sw;dh=a.length>=5?a[4]:sh}
+              drawAura(this,this.getTransform(),dx+(mt.cx-sx)*dw/sw,dy+(mt.cy-sy)*dh/sh,mt.r*dw/sw);
+            });
+
+            /* ball + aura for pattern-filled discs */
+            post('fill',function(){
+              var a=G.arc;if(!a||G.n!==1)return;
+              var m=a.m,fs=this.fillStyle;
+              if(aOn&&G.pt.has(fs)){drawAura(this,m,a.x,a.y,a.r);return}
+              if(bOn&&a.r>8.5&&a.r<11.5){
+                var p=ap(m,a.x,a.y),r=a.r*sc(m),c=this;G.busy++;
+                try{c.save();c.setTransform(1,0,0,1,0,0);HBX.trail(c,G.tr,p[0],p[1],r,B);HBX.ball(c,p[0],p[1],r,B,ok(IB)?IB:null)}
+                finally{c.restore();G.busy--}
+              }
+            });
+          }
+
+          /* ---------- Auto flow: nickname, create room, avatar ---------- */
+          var AU=H.auto||{},mode=AU.mode,st={nick:0,list:0,dlg:0,join:0};
+          var qs=function(s,r){return(r||document).querySelector(s)};
+          var setv=function(e,v){
+            try{
+              var d=Object.getOwnPropertyDescriptor(e.tagName=='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype,'value');
+              d.set.call(e,v);
+            }catch(x){e.value=v}
+            e.dispatchEvent(new Event('input',{bubbles:true}));
+            e.dispatchEvent(new Event('change',{bubbles:true}));
+          };
+          var btn=function(r,re,hook){
+            var b=hook&&qs('[data-hook="'+hook+'"]',r);
+            if(b)return b;
+            var l=[].slice.call(r.querySelectorAll('button'));
+            for(var i=0;i<l.length;i++)if(re.test(l[i].textContent.trim()))return l[i];
+          };
+          var say=function(t){
+            var i=qs('.chatbox-view [data-hook=input]')||qs('.chatbox-view input');
+            if(!i)return;
+            setv(i,t);
+            ['keydown','keypress','keyup'].forEach(function(n){
+              i.dispatchEvent(new KeyboardEvent(n,{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));
+            });
+          };
+          setInterval(function(){
+            try{
+              var nv=qs('.choose-nickname-view');
+              if(nv){
+                st.join=0;
+                var i=qs('input',nv);
+                if(i&&!i.value&&H.nick)setv(i,H.nick);
+                if(!st.nick&&i&&i.value&&mode){st.nick=1;var b=btn(nv,/^(ok|aceptar)$/i,'ok');if(b)setTimeout(function(){b.click()},250)}
+                return;
+              }
+              st.nick=0;
+              var cr=qs('.create-room-view');
+              if(cr){
+                if(!st.dlg&&(mode=='create'||mode=='train')){
+                  st.dlg=1;
+                  var R=H.room||{},tr=mode=='train',e;
+                  var nm=tr?'Entrenamiento '+(H.nick||''):(R.name||('Sala de '+(H.nick||'HazBall')));
+                  if(e=qs('[data-hook=name]',cr))setv(e,nm);
+                  if(e=qs('[data-hook=pass]',cr))setv(e,tr?'':(R.pass||''));
+                  if(e=qs('[data-hook=max-pl]',cr))setv(e,String(tr?4:(R.max||12)));
+                  if(e=qs('[data-hook=unlisted]',cr)){var un=!!(tr||R.unlisted);if(e.checked!==un)e.click()}
+                  var c=btn(cr,/^(create|crear)$/i,'create');
+                  if(c)setTimeout(function(){c.click()},400);
+                }
+                return;
+              }
+              st.dlg=0;
+              var rl=qs('.roomlist-view');
+              if(rl){
+                st.join=0;
+                if((mode=='create'||mode=='train')&&!st.list){st.list=1;var cb=btn(rl,/create|crear/i,'create');if(cb)cb.click()}
+                return;
+              }
+              if(qs('.room-view,.game-view')){
+                if(!st.join)st.join=Date.now();
+                else if(st.join>1&&Date.now()-st.join>1500){st.join=1;if(H.avatar)say('/avatar '+H.avatar)}
+              }
+            }catch(e){}
+          },500);
+
+          /* ---------- Touch drag for moving players in the room ---------- */
+          var D=null,L=null,tm=0;
+          var fire=function(t,x,y,el){
+            var o={bubbles:true,cancelable:true,clientX:x,clientY:y,view:window,buttons:1};
+            try{el.dispatchEvent(D.dr?new DragEvent(t,Object.assign(o,{dataTransfer:D.dt})):new MouseEvent(t,o))}catch(e){}
+          };
+          document.addEventListener('touchstart',function(e){
+            var t=e.touches[0],el=e.target.closest&&e.target.closest('.room-view .player-list-item');
+            if(!el||e.touches.length>1)return;
+            L={x:t.clientX,y:t.clientY};
+            clearTimeout(tm);
+            tm=setTimeout(function(){
+              if(!L)return;
+              D={el:el,dr:!!el.draggable,dt:window.DataTransfer?new DataTransfer():null};
+              fire(D.dr?'dragstart':'mousedown',L.x,L.y,el);
+            },320);
+          },{passive:true});
+          document.addEventListener('touchmove',function(e){
+            var t=e.touches[0];
+            if(D){
+              e.preventDefault();
+              fire(D.dr?'dragover':'mousemove',t.clientX,t.clientY,document.elementFromPoint(t.clientX,t.clientY)||document.body);
+            }else if(L&&Math.hypot(t.clientX-L.x,t.clientY-L.y)>10){clearTimeout(tm);L=null}
+          },{passive:false});
+          document.addEventListener('touchend',function(e){
+            clearTimeout(tm);
+            if(D){
+              var t=e.changedTouches[0],u=document.elementFromPoint(t.clientX,t.clientY)||document.body;
+              if(D.dr){fire('drop',t.clientX,t.clientY,u);fire('dragend',t.clientX,t.clientY,D.el)}
+              else fire('mouseup',t.clientX,t.clientY,u);
+              D=null;e.preventDefault();
+            }
+            L=null;
+          },{passive:false});
+          document.addEventListener('contextmenu',function(e){if(L||D)e.preventDefault()});
+          })();
+          EOF
+          cat > app/src/main/assets/menu.html <<'EOF'
+          <!doctype html>
+          <html><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+          <style>
+          *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none}
+          input{-webkit-user-select:text;user-select:text}
+          html,body{margin:0;height:100%;overflow:hidden;background:radial-gradient(ellipse at 30% 0%,#17335f,#070b16 65%);font-family:system-ui,sans-serif;color:#e8f1ff}
+          #rain{position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none}
+          #app{position:fixed;inset:0;display:grid;grid-template-columns:128px 1fr 200px;grid-template-rows:auto 1fr;gap:8px 10px;padding:8px 14px}
+          header{grid-column:1/4;display:flex;align-items:center;gap:10px}
+          .logo{font:900 24px/1 system-ui;letter-spacing:3px;text-shadow:0 0 14px #4da3ff}
+          .logo b{color:#4da3ff}
+          .tag{font-size:11px;opacity:.6;flex:1}
+          nav{display:flex;flex-direction:column;gap:6px;overflow:auto}
+          nav b{padding:10px 8px;border-radius:12px;background:rgba(255,255,255,.06);font-size:13px;font-weight:600;border:1px solid transparent}
+          nav b.on{background:rgba(77,163,255,.22);border-color:#4da3ff}
+          main{overflow:auto;background:rgba(10,18,36,.66);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:12px}
+          .row{display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap}
+          .row>label{width:86px;font-size:12px;opacity:.75;flex:none}
+          .chips{display:flex;flex-wrap:wrap;gap:6px;flex:1}
+          .chips b{padding:7px 11px;border-radius:999px;background:rgba(255,255,255,.08);font-size:12px;font-weight:600;border:1px solid transparent}
+          .chips b.on{background:#4da3ff;color:#04101f}
+          input[type=text]{flex:1;min-width:100px;padding:9px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.3);color:#fff;font-size:14px}
+          input[type=range]{flex:1}
+          input[type=color]{width:44px;height:30px;border:0;padding:0;background:none}
+          input[type=checkbox]{width:22px;height:22px}
+          h4{margin:6px 0 8px;font-size:12px;letter-spacing:1px;text-transform:uppercase;color:#4da3ff}
+          .note{font-size:11px;opacity:.6;margin:4px 0}
+          button{font:inherit;color:#fff;border:0;cursor:pointer}
+          .sm{padding:8px 12px;border-radius:10px;background:rgba(255,255,255,.12);font-size:12px;font-weight:600}
+          .act{flex:1;min-width:110px;padding:14px 8px;border-radius:14px;background:linear-gradient(135deg,#1f6feb,#7b5cff);font-size:13px;font-weight:700}
+          aside{display:flex;flex-direction:column;align-items:center;gap:8px;min-height:0}
+          #pv{width:100%;max-width:200px;aspect-ratio:1;border-radius:16px;background:rgba(10,18,36,.66);border:1px solid rgba(255,255,255,.1)}
+          .big{width:100%;padding:14px;border-radius:14px;background:linear-gradient(135deg,#27c26b,#14a1a1);font:800 16px system-ui;box-shadow:0 0 18px rgba(39,194,107,.4)}
+          </style></head><body>
+          <canvas id="rain"></canvas>
+          <div id="app">
+            <header><div class="logo">HAZ<b>BALL</b></div><div class="tag">mobile edition</div><button class="sm" onclick="B.quit()">Salir</button></header>
+            <nav id="tabs"></nav>
+            <main id="pane"></main>
+            <aside><canvas id="pv" width="220" height="220"></canvas><button class="big" id="go">▶ JUGAR</button></aside>
+          </div>
+          <script src="common.js"></script>
+          <script>
+          var B=window.HBApp||{get:function(){return'{}'},save:function(){},play:function(){},started:function(){return false},quit:function(){}};
+          var DEF={nick:'',avatar:'HB',
+            jersey:{on:false,pat:'v',c:['#e53935','#ffffff','#111111'],num:''},photo:'',photoOn:false,
+            aura:{type:'ring',color:'#00e5ff',size:1,speed:1},
+            ball:{skin:'classic',color:'#ffd400',trail:'none',photo:''},
+            screen:{stretch:'off',quality:1,fps:60,noads:true},
+            pad:{scale:1,alpha:1,left:false,vib:true},
+            room:{name:'',pass:'',max:12,unlisted:false},auto:{mode:'join'}};
+          function merge(a,b){for(var k in b){if(b[k]&&typeof b[k]=='object'&&!Array.isArray(b[k])&&a[k]&&typeof a[k]=='object'&&!Array.isArray(a[k]))merge(a[k],b[k]);else a[k]=b[k]}return a}
+          var C=DEF;try{C=merge(DEF,JSON.parse(B.get()||'{}'))}catch(e){}
+          var dirty=false,cur=0,$=function(i){return document.getElementById(i)};
+
+          var OPT={
+           'jersey.pat':[['solid','Lisa'],['v','Rayas V'],['h','Rayas H'],['d','Diagonal'],['half','Mitades'],['check','Cuadros']],
+           'aura.type':[['none','Ninguna'],['ring','Neón'],['pulse','Pulso'],['rainbow','Arcoíris'],['fire','Fuego'],['bolt','Rayos'],['stars','Estrellas']],
+           'ball.skin':[['classic','Clásica'],['color','Color'],['soccer','Fútbol'],['basket','Básquet'],['tennis','Tenis'],['neon','Neón'],['fire','Fuego']],
+           'ball.trail':[['none','Sin estela'],['line','Color'],['fire','Fuego'],['rainbow','Arcoíris']],
+           'screen.stretch':[['off','Normal'],['43','4:3 estirado'],['54','5:4'],['32','3:2']],
+           'screen.quality':[['.5','Baja'],['.75','Media'],['1','Nativa']],
+           'screen.fps':[['30','30'],['60','60'],['90','90'],['120','120'],['0','Sin límite']],
+           'room.max':[['2','2'],['4','4'],['6','6'],['8','8'],['12','12'],['16','16'],['30','30']]
+          };
+          function row(l,h){return'<div class="row"><label>'+l+'</label>'+h+'</div>'}
+          function chips(k,l){return row(l,'<div class="chips" data-k="'+k+'">'+OPT[k].map(function(o){return'<b data-v="'+o[0]+'">'+o[1]+'</b>'}).join('')+'</div>')}
+          function rng(k,l,a,b,s){return row(l,'<input type="range" data-k="'+k+'" min="'+a+'" max="'+b+'" step="'+s+'">')}
+          function col(k,l){return row(l,'<input type="color" data-k="'+k+'">')}
+          function txt(k,l,ph,m){return row(l,'<input type="text" data-k="'+k+'" placeholder="'+ph+'" maxlength="'+m+'">')}
+          function chk(k,l){return row(l,'<input type="checkbox" data-k="'+k+'">')}
+          function sub(t){return'<h4>'+t+'</h4>'}
+
+          var TABS=[
+          ['🏟','Jugar',function(){return txt('nick','Tu nombre','Nombre en HaxBall',20)+
+           '<div class="row"><button class="act" onclick="start(\'join\')">🌐 Entrar a salas</button><button class="act" onclick="start(\'create\')">🛠 Crear sala</button><button class="act" onclick="start(\'train\')">🎯 Entrenar</button></div>'+
+           sub('Tu sala')+txt('room.name','Nombre','Mi sala',30)+txt('room.pass','Contraseña','(opcional)',20)+chips('room.max','Jugadores')+chk('room.unlisted','Sala oculta')+
+           '<p class="note">Entrenar crea una sala oculta para 4. Si pide el captcha de Google, resolvelo. Dentro de la sala, mantené apretado un jugador y arrastralo para moverlo de equipo.</p>'}],
+          ['👤','Personaje',function(){return txt('avatar','Avatar (2)','HB',2)+
+           sub('Camiseta propia')+chk('jersey.on','Usar camiseta')+chips('jersey.pat','Diseño')+
+           row('Colores',['0','1','2'].map(function(i){return'<input type="color" data-k="jersey.c.'+i+'">'}).join('')+'<span class="note">base · franjas · detalle</span>')+
+           txt('jersey.num','Número','10',2)+
+           sub('Foto en tu personaje')+chk('photoOn','Usar foto')+
+           '<div class="row"><button class="sm" onclick="pick(\'photo\')">📷 Elegir foto</button><button class="sm" onclick="set(\'photo\',\'\');render()">Quitar</button></div>'+
+           '<p class="note">Camiseta, foto y aura se ven en TU pantalla. Los demás ven tu avatar. Si otro usa el mismo avatar, en tu pantalla también se verá con tu skin.</p>'}],
+          ['✨','Aura',function(){return chips('aura.type','Tipo')+col('aura.color','Color')+rng('aura.size','Tamaño',.5,2,.1)+rng('aura.speed','Velocidad',.3,3,.1)+
+           '<p class="note">Fuego y Arcoíris usan sus propios colores.</p>'}],
+          ['⚽','Pelota',function(){return chips('ball.skin','Estilo')+col('ball.color','Color')+chips('ball.trail','Estela')+
+           '<div class="row"><label>Foto</label><button class="sm" onclick="pick(\'ball.photo\')">📷 Elegir foto</button><button class="sm" onclick="set(\'ball.photo\',\'\');render()">Quitar</button></div>'}],
+          ['📺','Pantalla',function(){return chips('screen.stretch','Estirado')+chips('screen.quality','Calidad')+chips('screen.fps','FPS')+chk('screen.noads','Sin anuncios')+
+           '<p class="note">El estirado 4:3 agranda todo a lo ancho sin cambiar la resolución del teléfono. Calidad baja = más rendimiento. Los cambios se aplican al recargar el juego.</p>'}],
+          ['🎮','Controles',function(){return rng('pad.scale','Tamaño',.6,1.6,.05)+rng('pad.alpha','Opacidad',.2,1,.05)+chk('pad.left','Zurdo')+chk('pad.vib','Vibración')+
+           '<p class="note">Joystick a un lado, botón PATEAR al otro. 🎮 arriba a la derecha los oculta; ☰ abre este menú.</p>'}]
+          ];
+
+          function get(p){return p.split('.').reduce(function(o,k){return o[k]},C)}
+          function set(p,v){var a=p.split('.'),l=a.pop(),o=a.reduce(function(o,k){return o[k]},C);o[l]=v;dirty=true;B.save(JSON.stringify(C));loadImgs()}
+          function cv(v){return v!==''&&!isNaN(v)?+v:v}
+          function mark(e,v){[].forEach.call(e.children,function(c){c.classList.toggle('on',cv(c.dataset.v)===v)})}
+          function bind(){
+            $('pane').querySelectorAll('[data-k]').forEach(function(e){
+              var k=e.dataset.k,v=get(k);
+              if(e.classList.contains('chips')){
+                mark(e,v);
+                e.onclick=function(ev){var t=ev.target;if(t.dataset.v==null)return;set(k,cv(t.dataset.v));mark(e,get(k))};
+              }else if(e.type=='checkbox'){e.checked=!!v;e.onchange=function(){set(k,e.checked)}}
+              else{e.value=v;e.oninput=function(){set(k,e.type=='range'?+e.value:e.value)}}
+            });
+          }
+          function render(i){
+            if(i!=null)cur=i;
+            $('tabs').innerHTML=TABS.map(function(t,j){return'<b class="'+(j==cur?'on':'')+'" onclick="render('+j+')">'+t[0]+' '+t[1]+'</b>'}).join('');
+            $('pane').innerHTML=TABS[cur][2]();
+            bind();
+          }
+          function pick(k){
+            var f=document.createElement('input');f.type='file';f.accept='image/*';
+            f.onchange=function(){
+              if(!f.files[0])return;
+              var fr=new FileReader();
+              fr.onload=function(){
+                var im=new Image();
+                im.onload=function(){
+                  var c=document.createElement('canvas');c.width=c.height=128;
+                  var s=Math.min(im.width,im.height);
+                  c.getContext('2d').drawImage(im,(im.width-s)/2,(im.height-s)/2,s,s,0,0,128,128);
+                  set(k,c.toDataURL('image/jpeg',.85));
+                  if(k=='photo')set('photoOn',true);
+                  render();
+                };
+                im.src=fr.result;
+              };
+              fr.readAsDataURL(f.files[0]);
+            };
+            f.click();
+          }
+          function start(mode){C.auto={mode:mode};B.play(JSON.stringify(C),true);dirty=false}
+          $('go').onclick=function(){
+            if(B.started()&&!dirty){B.play(JSON.stringify(C),false)}
+            else{C.auto={mode:'join'};B.play(JSON.stringify(C),true);dirty=false}
+          };
+          window.onShow=function(){$('go').textContent=(B.started()&&!dirty)?'▶ VOLVER AL JUEGO':(B.started()?'↻ APLICAR Y JUGAR':'▶ JUGAR')};
+
+          /* preview */
+          var pc=$('pv').getContext('2d'),IP=new Image(),IB=new Image(),tr=[];
+          function loadImgs(){IP.src=C.photo||'';IB.src=C.ball.photo||''}
+          function ok(i){return i.complete&&i.naturalWidth>0}
+          function pv(t){
+            var c=pc,s=t/1000,px=72,py=112,r=34,photo=C.photoOn&&ok(IP);
+            c.clearRect(0,0,220,220);
+            if(photo)HBX.cimg(c,IP,px,py,r);
+            else if(C.jersey.on)HBX.jersey(c,px,py,r,C.jersey);
+            else{c.fillStyle='#e56e56';c.beginPath();c.arc(px,py,r,0,6.2832);c.fill();c.lineWidth=3;c.strokeStyle='#000';c.stroke()}
+            if(!photo){c.fillStyle='#fff';c.font='bold 20px sans-serif';c.textAlign='center';c.textBaseline='middle';c.fillText(C.avatar,px,py)}
+            HBX.aura(c,px,py,r,C.aura,s);
+            var bx=150+Math.cos(s*1.6)*20,by=150+Math.sin(s*1.1)*40,br=20;
+            c.fillStyle='#fff';c.beginPath();c.arc(bx,by,br,0,6.2832);c.fill();c.lineWidth=2.5;c.strokeStyle='#000';c.stroke();
+            HBX.trail(c,tr,bx,by,br,C.ball);
+            HBX.ball(c,bx,by,br,C.ball,ok(IB)?IB:null);
+          }
+
+          /* rain */
+          var FX=1,run=0,rc=$('rain'),rx=rc.getContext('2d'),W,Hh,dr=[],rp=[],fl=0;
+          function rs(){W=rc.width=innerWidth;Hh=rc.height=innerHeight}
+          rs();addEventListener('resize',rs);
+          function nd(init){return{x:Math.random()*(W+200)-100,y:init?Math.random()*Hh:-30,l:12+Math.random()*20,v:11+Math.random()*10,a:.15+Math.random()*.4}}
+          for(var q=0;q<130;q++)dr.push(nd(1));
+          function loop(t){
+            if(!FX){run=0;return}
+            requestAnimationFrame(loop);
+            rx.clearRect(0,0,W,Hh);
+            if(fl>0){rx.fillStyle='rgba(190,215,255,'+fl*.2+')';rx.fillRect(0,0,W,Hh);fl-=.04}
+            else if(Math.random()<.002)fl=1;
+            rx.lineWidth=1.2;rx.lineCap='round';
+            for(var i=0;i<dr.length;i++){
+              var d=dr[i];
+              rx.strokeStyle='rgba(160,200,255,'+d.a+')';rx.beginPath();rx.moveTo(d.x,d.y);rx.lineTo(d.x-d.l*.25,d.y+d.l);rx.stroke();
+              d.y+=d.v;d.x-=d.v*.25;
+              if(d.y>Hh){if(Math.random()<.4)rp.push({x:d.x,y:Hh-Math.random()*40,r:1,a:.5});dr[i]=nd(0)}
+            }
+            for(i=rp.length-1;i>=0;i--){
+              var p=rp[i];
+              rx.strokeStyle='rgba(160,200,255,'+p.a+')';rx.beginPath();rx.ellipse(p.x,p.y,p.r,p.r*.35,0,0,6.28);rx.stroke();
+              p.r+=.8;p.a-=.02;if(p.a<=0)rp.splice(i,1);
+            }
+            pv(t||0);
+          }
+          window.fx=function(on){FX=on;if(on&&!run){run=1;requestAnimationFrame(loop)}if(on)onShow()};
+          loadImgs();render(0);onShow();fx(1);
+          </script></body></html>
+          EOF
+          gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with: {name: hazball-apk, path: app/build/outputs/apk/debug/app-debug.apk}
